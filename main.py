@@ -3,7 +3,7 @@ import socket
 import string, random
 import hashlib
 import multiprocessing
-import os
+import os , time
 
 
 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -22,14 +22,20 @@ conn = tls_sock.makefile('rwb')
 authdata = ''
 
 def pow_worker(authdata, difficulty):
+    random.seed(os.getpid() ^ int(time.time() * 1000))
     chars = string.ascii_letters + string.digits
     prefix = "0" * difficulty
 
     while True:
         suffix = ''.join(random.choices(chars, k=16))
         digest = hashlib.sha1((authdata + suffix).encode("utf-8")).hexdigest()
+
         if digest.startswith(prefix):
             return suffix
+
+def run_pow(args):
+    authdata, difficulty = args
+    return pow_worker(authdata, difficulty)
 
 def reply(token, value):
     digest = hashlib.sha1((authdata + token).encode("utf-8")).hexdigest()
@@ -51,7 +57,7 @@ def main():
             args = line.split()
 
             if args[0] == "HELO":
-                print("→ Sending EHLO")
+                print("-> Sending EHLO")
                 conn.write(b"EHLO\n")
                 conn.flush()
 
@@ -60,28 +66,27 @@ def main():
                 break
 
             elif args[0] == "POW":
-
                 tls_sock.settimeout(None)
-                authdata,  difficulty = args[1], int(args[2])
+                authdata, difficulty = args[1], int(args[2])
 
-                cpu_count = os.cpu_count()
-                print("→ Using", cpu_count, "processes")
+                cpu_count = os.cpu_count() or 4
+                print("-> Using", cpu_count, "processes")
 
                 pool = multiprocessing.Pool(processes=cpu_count)
-                results = []
+                tasks = [(authdata, difficulty)] * cpu_count
 
-                for _ in range(cpu_count):
-                    results.append(pool.apply_async(pow_worker(authdata, difficulty)))
-
-                found_suffix = None
-                for result in results:
-                    suffix = result.get()
-                    if suffix:
+                try:
+                    found_suffix = None
+                    for suffix in pool.imap_unordered(run_pow, tasks):
                         found_suffix = suffix
                         break
-
-                pool.terminate()
-                pool.join()
+                finally:
+                    pool.terminate()
+                    pool.join()
+                
+                if not found_suffix:
+                    print("ERROR: POW not solved")
+                    break
 
                 conn.write((found_suffix + "\n").encode("utf-8"))
                 conn.flush()
