@@ -1,9 +1,8 @@
 import ssl
 import socket
-import string, random
 import hashlib
-import multiprocessing
-import os , time
+import multiprocessing as mp
+import os
 
 
 context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
@@ -15,27 +14,84 @@ context.load_cert_chain(certfile="challenge-38-c-.pem", keyfile="challenge-38-c-
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 tls_sock = context.wrap_socket(sock, server_hostname="18.202.148.130")
 
-tls_sock.settimeout(10)
+tls_sock.settimeout(6)
 tls_sock.connect(("18.202.148.130", 3336))
 
 conn = tls_sock.makefile('rwb')
 authdata = ''
+STOP_EVENT = None
+def _init_worker(stop_event):
+    global STOP_EVENT
+    STOP_EVENT = stop_event
 
-def pow_worker(authdata, difficulty):
-    random.seed(os.getpid() ^ int(time.time() * 1000))
-    chars = string.ascii_letters + string.digits
-    prefix = "0" * difficulty
+
+def pow_worker_optimized(authdata: str, difficulty: int, start: int, step: int) -> str:
+    auth_bytes = authdata.encode("utf-8")
+    counter = start
+    sha1 = hashlib.sha1
+    event_is_set = STOP_EVENT.is_set
+    event_set = STOP_EVENT.set
+
+    full_bytes = difficulty // 2
+    half_nibble = difficulty % 2
+    zero_prefix = b"\x00" * full_bytes
+    check_interval = 4096
 
     while True:
-        suffix = ''.join(random.choices(chars, k=16))
-        digest = hashlib.sha1((authdata + suffix).encode("utf-8")).hexdigest()
+        for _ in range(check_interval):
+            
+            suffix = format(counter, "x").encode("ascii")
+            h = sha1(auth_bytes + suffix).digest()
+            counter += step
 
-        if digest.startswith(prefix):
-            return suffix
+            if h[:full_bytes] == zero_prefix and (not half_nibble or (h[full_bytes] >> 4) == 0):
+                event_set()
+                return suffix.decode("ascii")
 
-def run_pow(args):
-    authdata, difficulty = args
-    return pow_worker(authdata, difficulty)
+        if event_is_set():
+            return None
+
+    return None
+
+def _worker_wrapper(args):
+    return pow_worker_optimized(*args)
+
+
+def solve_pow(authdata: str, difficulty: int) -> str:
+    cpu_count = os.cpu_count() or 4
+    print("-> Using", cpu_count, "processes")
+
+    methods = mp.get_all_start_methods()
+    method = "fork" if "fork" in methods else "spawn"
+    ctx = mp.get_context(method)
+    manager = None
+    if method == "fork":
+        stop_event = ctx.Event()
+    else:
+        manager = ctx.Manager()
+        stop_event = manager.Event()
+
+    tasks = [
+        (authdata, difficulty, i, cpu_count)
+        for i in range(cpu_count)
+    ]
+
+    with ctx.Pool(cpu_count, initializer=_init_worker, initargs=(stop_event,)) as pool:
+        try:
+            for result in pool.imap_unordered(_worker_wrapper, tasks):
+                if result:
+                    stop_event.set()
+                    pool.terminate()
+                    pool.join()
+                    return result
+        finally:
+            pool.terminate()
+            pool.join()
+            if manager is not None:
+                manager.shutdown()
+
+    raise RuntimeError("PoW not solved")
+
 
 def reply(token, value):
     digest = hashlib.sha1((authdata + token).encode("utf-8")).hexdigest()
@@ -55,6 +111,8 @@ def main():
             print("Received:", line)
 
             args = line.split()
+            if not args:
+                continue
 
             if args[0] == "HELO":
                 print("-> Sending EHLO")
@@ -69,20 +127,7 @@ def main():
                 tls_sock.settimeout(None)
                 authdata, difficulty = args[1], int(args[2])
 
-                cpu_count = os.cpu_count() or 4
-                print("-> Using", cpu_count, "processes")
-
-                pool = multiprocessing.Pool(processes=cpu_count)
-                tasks = [(authdata, difficulty)] * cpu_count
-
-                try:
-                    found_suffix = None
-                    for suffix in pool.imap_unordered(run_pow, tasks):
-                        found_suffix = suffix
-                        break
-                finally:
-                    pool.terminate()
-                    pool.join()
+                found_suffix = solve_pow(authdata, difficulty)
                 
                 if not found_suffix:
                     print("ERROR: POW not solved")
@@ -90,7 +135,7 @@ def main():
 
                 conn.write((found_suffix + "\n").encode("utf-8"))
                 conn.flush()
-                tls_sock.settimeout(10)
+                tls_sock.settimeout(6)
             
             elif args[0] == "END":
                 conn.write(b"OK\n")
